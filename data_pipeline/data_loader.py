@@ -158,6 +158,24 @@ class NPPADDataLoader:
                 samples.append(df)
                 labels.append(label_id)
 
+        # Enforce a consistent column set across all samples.
+        # Some CSVs may have extra columns; keep only the intersection.
+        if samples:
+            common_cols = set(samples[0].columns)
+            for df in samples[1:]:
+                common_cols &= set(df.columns)
+            common_cols_sorted = [
+                c for c in samples[0].columns if c in common_cols
+            ]
+            if any(len(df.columns) != len(common_cols_sorted) for df in samples):
+                logger.warning(
+                    "Column count varies across CSVs; "
+                    "keeping %d common columns out of max %d",
+                    len(common_cols_sorted),
+                    max(len(df.columns) for df in samples),
+                )
+                samples = [df.select(common_cols_sorted) for df in samples]
+
         logger.info(
             "Total: %d samples across %d classes", len(samples), len(label_map)
         )
