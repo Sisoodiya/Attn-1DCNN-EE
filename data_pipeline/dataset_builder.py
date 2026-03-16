@@ -2,22 +2,30 @@
 Dataset Builder — Step 5: PyTorch Lightning DataModule
 ======================================================
 
-Orchestrates the full NPPAD data pipeline and exposes the result as a
-PyTorch Lightning ``LightningDataModule`` with train / validation / test
-splits.
+PyTorch Dataset and Lightning DataModule that orchestrate the full pipeline.
 
-Output tensors are shaped for a **1D-CNN** model:
+RAM-efficient design
+--------------------
+``NPPADDataset`` uses **lazy windowing**: it stores the cleaned, scaled
+per-sample numpy arrays (one array per CSV file) and computes each sliding
+window on-the-fly inside ``__getitem__``.  This avoids pre-materialising a
+huge ``(N_windows, window_size, F)`` tensor in RAM — critical on Colab T4.
 
-* ``x`` — ``(F, I)``  *(channels-first)*: *F* features treated as input
-  channels, *I* time steps as the spatial dimension for 1-D convolution.
-* ``y`` — scalar integer class label.
+Memory comparison (all 18 accident classes, window_size=50, stride=1):
 
-Classes
--------
-NPPADDataset
-    ``torch.utils.data.Dataset`` wrapper around windowed numpy arrays.
-NPPADDataModule
-    Full-pipeline ``LightningDataModule``.
++-----------+----------------+----------+
+| Strategy  | ~Windows       | ~RAM     |
++===========+================+==========+
+| Eager     | ≈ 500,000      | ≈ 9 GB   |
++-----------+----------------+----------+
+| Lazy      | computed live  | ≈ 300 MB |
++-----------+----------------+----------+
+
+Output tensor per item
+-----------------------
+``x`` — ``(F, I)`` *(channels-first)*: *F* sensor features × *I* time steps,
+the correct layout for ``nn.Conv1d``.
+``y`` — scalar integer class label.
 """
 
 from __future__ import annotations
@@ -45,41 +53,101 @@ from data_pipeline.sliding_window import SlidingWindowTransformer
 
 
 # ======================================================================
-# PyTorch Dataset
+# Lazy Sliding-Window Dataset
 # ======================================================================
 
 class NPPADDataset(Dataset):
-    """Thin ``Dataset`` wrapper around windowed NPPAD arrays.
+    """Memory-efficient Dataset with lazy sliding-window computation.
+
+    Instead of pre-materialising every window (which can require several GB
+    of RAM), this dataset stores the raw ``(T_i, F)`` samples and computes
+    each window on demand inside ``__getitem__``.
 
     Parameters
     ----------
-    features : np.ndarray
-        Shape ``(N, window_size, num_features)`` — sliding-window matrices.
-    labels : np.ndarray
-        Shape ``(N,)`` — integer class labels.
-
-    Notes
-    -----
-    ``__getitem__`` returns tensors with the feature axis first
-    (``(F, I)``), which is the standard layout for ``torch.nn.Conv1d``.
+    samples : list[np.ndarray]
+        Per-CSV feature arrays, each of shape ``(T_i, F)``.
+    labels : list[int]
+        Integer class label per sample (aligned with *samples*).
+    window_size : int
+        Number of time steps per window (*I*).
+    stride : int
+        Step between consecutive window start positions.
     """
 
-    def __init__(self, features: np.ndarray, labels: np.ndarray) -> None:
-        assert features.shape[0] == labels.shape[0], (
-            f"Feature/label count mismatch: {features.shape[0]} vs {labels.shape[0]}"
+    def __init__(
+        self,
+        samples: List[np.ndarray],
+        labels: List[int],
+        window_size: int = 50,
+        stride: int = 1,
+    ) -> None:
+        self.window_size = window_size
+        self.stride = stride
+
+        # Store samples as float32 tensors to avoid repeated conversion.
+        self.samples: List[torch.Tensor] = []
+        self.sample_labels: List[int] = []
+
+        # For each sample, compute how many windows it yields and build
+        # a cumulative-sum index for O(log N) lookup in __getitem__.
+        window_counts: List[int] = []
+
+        for arr, lbl in zip(samples, labels):
+            arr = np.asarray(arr, dtype=np.float32)
+            T = arr.shape[0]
+            if T < window_size:
+                logger.debug(
+                    "Sample length (%d) < window_size (%d); skipping.",
+                    T, window_size,
+                )
+                continue
+            n_windows = (T - window_size) // stride + 1
+            self.samples.append(torch.from_numpy(arr))
+            self.sample_labels.append(lbl)
+            window_counts.append(n_windows)
+
+        if not self.samples:
+            raise ValueError(
+                "No valid samples after filtering short sequences. "
+                f"Try reducing window_size (current: {window_size})."
+            )
+
+        # Cumulative window counts for fast index lookup.
+        self._cum_windows = np.cumsum([0] + window_counts)
+        self._total_windows = int(self._cum_windows[-1])
+
+        logger.info(
+            "NPPADDataset: %d samples → %d windows "
+            "(window_size=%d, stride=%d, RAM-lazy)",
+            len(self.samples), self._total_windows, window_size, stride,
         )
-        # Store as tensors immediately to avoid repeated conversions.
-        self.features = torch.from_numpy(features).float()
-        self.labels = torch.from_numpy(labels).long()
+
+    # ------------------------------------------------------------------
+    # Dataset protocol
+    # ------------------------------------------------------------------
 
     def __len__(self) -> int:
-        return self.features.shape[0]
+        return self._total_windows
 
     def __getitem__(self, idx: int):
-        # Transpose (window_size, num_features) → (num_features, window_size)
-        # so Conv1d treats each sensor as a channel.
-        x = self.features[idx].T          # (F, I)
-        y = self.labels[idx]              # scalar
+        """Return the *idx*-th window as ``(x, y)`` tensors.
+
+        x shape: ``(F, I)`` — channels-first for ``Conv1d``.
+        y shape: ``()``     — scalar label.
+        """
+        if idx < 0:
+            idx = self._total_windows + idx
+
+        # Binary search: which sample does this global index fall in?
+        sample_idx = int(np.searchsorted(self._cum_windows, idx + 1, side="right")) - 1
+        window_offset = (idx - int(self._cum_windows[sample_idx])) * self.stride
+
+        arr = self.samples[sample_idx]          # (T, F)
+        window = arr[window_offset : window_offset + self.window_size]   # (I, F)
+
+        x = window.T.contiguous()              # (F, I) — channels-first
+        y = torch.tensor(self.sample_labels[sample_idx], dtype=torch.long)
         return x, y
 
 
@@ -96,47 +164,48 @@ class NPPADDataModule(pl.LightningDataModule):
     2. **Clean** — handle NaN and outliers via :class:`DataCleaner`.
     3. **Scale** — Z-score (default) or Min-Max via :class:`ZScoreScaler`
        / :class:`MinMaxScaler`.
-    4. **Window** — sliding-window segmentation via
-       :class:`SlidingWindowTransformer`.
-    5. **Split** — stratified train / validation / test partitioning.
+    4. **Split** — sample-level stratified train / validation / test split.
+    5. **Dataset** — wrap each split in :class:`NPPADDataset` for lazy
+       on-the-fly windowing.
 
     Parameters
     ----------
     data_dir : str | Path
         Path to ``Operation_csv_data/`` directory.
     window_size : int
-        Number of time steps per sliding window (*I*).
+        Number of time steps per sliding window (*I*).  Default ``50``.
     stride : int
-        Step between consecutive window starts.
+        Step between consecutive window starts.  Default ``5``.
+        Increase to reduce the effective number of windows and save RAM/time.
     batch_size : int
-        Mini-batch size for dataloaders.
+        Mini-batch size for dataloaders.  Default ``64``.
     val_split : float
-        Fraction of data reserved for validation.
+        Fraction of *samples* reserved for validation.  Default ``0.15``.
     test_split : float
-        Fraction of data reserved for testing.
+        Fraction of *samples* reserved for testing.  Default ``0.15``.
     num_workers : int
-        DataLoader worker processes.
+        DataLoader worker processes.  Default ``2`` (Colab free tier).
     nan_strategy : str
         Strategy for :class:`DataCleaner` (``"interpolate"`` | ``"ffill"``).
     z_threshold : float
-        Z-score threshold for anomaly removal.
+        Z-score threshold for anomaly removal.  Default ``6.0``.
     scaler_type : str
-        ``"zscore"`` (default, primary) or ``"minmax"`` (secondary).
+        ``"zscore"`` (default) or ``"minmax"``.
     accident_types : list[str] | None
         Subset of accident types to load.  ``None`` loads all 18.
     random_seed : int
-        Seed for reproducible shuffling and splitting.
+        Seed for reproducible shuffling and splitting.  Default ``42``.
     """
 
     def __init__(
         self,
         data_dir: str | Path = "data/Operation_csv_data",
         window_size: int = 50,
-        stride: int = 1,
+        stride: int = 5,
         batch_size: int = 64,
         val_split: float = 0.15,
         test_split: float = 0.15,
-        num_workers: int = 4,
+        num_workers: int = 2,
         nan_strategy: str = "interpolate",
         z_threshold: float = 6.0,
         scaler_type: str = "zscore",
@@ -170,29 +239,50 @@ class NPPADDataModule(pl.LightningDataModule):
     # ------------------------------------------------------------------
 
     def setup(self, stage: Optional[str] = None) -> None:
-        """Execute the full data pipeline and create dataset splits."""
+        """Execute the full data pipeline and create dataset splits.
+
+        The window explosion step is deferred to the Dataset level
+        (lazy), so this method only allocates memory proportional to
+        the number of *samples* × their length, not the number of windows.
+        """
         logger.info("=== NPPAD DataModule setup (stage=%s) ===", stage)
 
         # 1. Load -----------------------------------------------------------
         loader = NPPADDataLoader(self.data_dir)
-        samples, labels, label_map = loader.load_all(
+        raw_samples, labels, label_map = loader.load_all(
             exclude_time=True, accident_types=self.accident_types
         )
         self.label_map = label_map
         self.num_classes = len(label_map)
         logger.info(
-            "Loaded %d samples, %d classes", len(samples), self.num_classes
+            "Loaded %d samples, %d classes", len(raw_samples), self.num_classes
         )
+
+        # Convert Polars → numpy arrays (loader returns Polars DataFrames)
+        import polars as pl_lib
+        np_samples: List[np.ndarray] = []
+        for df in raw_samples:
+            if hasattr(df, "to_numpy"):        # Polars
+                np_samples.append(df.to_numpy().astype(np.float32))
+            else:                              # pandas fallback
+                np_samples.append(df.values.astype(np.float32))
+
+        self.num_features = np_samples[0].shape[1] if np_samples else 0
 
         # 2. Clean ----------------------------------------------------------
         cleaner = DataCleaner(
             nan_strategy=self.nan_strategy, z_threshold=self.z_threshold
         )
-        samples = cleaner.clean_batch(samples)
+        cleaned: List[np.ndarray] = []
+        for arr in np_samples:
+            import pandas as pd
+            df_tmp = pd.DataFrame(arr)
+            cleaned.append(cleaner.clean(df_tmp).values.astype(np.float32))
+        logger.info("Cleaning complete.")
 
         # 3. Scale ----------------------------------------------------------
         if self.scaler_type == "zscore":
-            scaler = ZScoreScaler()
+            scaler: ZScoreScaler | MinMaxScaler = ZScoreScaler()
         elif self.scaler_type == "minmax":
             scaler = MinMaxScaler()
         else:
@@ -200,59 +290,74 @@ class NPPADDataModule(pl.LightningDataModule):
                 f"Unknown scaler_type '{self.scaler_type}'. "
                 "Use 'zscore' or 'minmax'."
             )
-        samples = scaler.fit_transform(samples)
-        self.num_features = samples[0].width if samples else 0
 
-        # 4. Sliding window -------------------------------------------------
-        windower = SlidingWindowTransformer(
-            window_size=self.window_size, stride=self.stride
+        # Fit on all data then transform each array in-place
+        import pandas as pd
+        all_concat = pd.DataFrame(np.vstack(cleaned))
+        scaler.fit([all_concat])          # fit_transform on concatenation
+
+        scaled: List[np.ndarray] = []
+        for arr in cleaned:
+            df_tmp = pd.DataFrame(arr)
+            scaled_df = scaler.transform([df_tmp])[0]
+            scaled.append(scaled_df.values.astype(np.float32))
+
+        del cleaned  # free intermediate RAM
+        logger.info("Scaling complete.")
+
+        # 4. Sample-level split (BEFORE windowing — keeps split clean) ------
+        train_samples, train_labels, val_samples, val_labels, \
+            test_samples, test_labels = self._stratified_split(scaled, labels)
+
+        del scaled  # free memory
+
+        # 5. Build lazy Datasets -------------------------------------------
+        self.train_dataset = NPPADDataset(
+            train_samples, train_labels, self.window_size, self.stride
         )
-        X, y = windower.transform_batch(samples, labels)
+        self.val_dataset = NPPADDataset(
+            val_samples, val_labels, self.window_size, self.stride
+        )
+        self.test_dataset = NPPADDataset(
+            test_samples, test_labels, self.window_size, self.stride
+        )
+
         logger.info(
-            "Windowed data: X %s, y %s", X.shape, y.shape
-        )
-
-        # 5. Train / val / test split (stratified shuffle) ------------------
-        self.train_dataset, self.val_dataset, self.test_dataset = (
-            self._stratified_split(X, y)
-        )
-
-        logger.info(
-            "Split sizes — train: %d, val: %d, test: %d",
+            "Window counts — train: %d, val: %d, test: %d",
             len(self.train_dataset),
             len(self.val_dataset),
             len(self.test_dataset),
         )
 
     def train_dataloader(self) -> DataLoader:
-        """Return the training DataLoader."""
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
-            pin_memory=True,
+            pin_memory=torch.cuda.is_available(),
             drop_last=True,
+            persistent_workers=self.num_workers > 0,
         )
 
     def val_dataloader(self) -> DataLoader:
-        """Return the validation DataLoader."""
         return DataLoader(
             self.val_dataset,
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
-            pin_memory=True,
+            pin_memory=torch.cuda.is_available(),
+            persistent_workers=self.num_workers > 0,
         )
 
     def test_dataloader(self) -> DataLoader:
-        """Return the test DataLoader."""
         return DataLoader(
             self.test_dataset,
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
-            pin_memory=True,
+            pin_memory=torch.cuda.is_available(),
+            persistent_workers=self.num_workers > 0,
         )
 
     # ------------------------------------------------------------------
@@ -261,24 +366,30 @@ class NPPADDataModule(pl.LightningDataModule):
 
     def _stratified_split(
         self,
-        X: np.ndarray,
-        y: np.ndarray,
+        samples: List[np.ndarray],
+        labels: List[int],
     ) -> tuple:
-        """Perform a stratified shuffle-split into train/val/test."""
+        """Sample-level stratified shuffle-split → train / val / test."""
         rng = np.random.RandomState(self.random_seed)
-        indices = np.arange(len(y))
+        indices = np.arange(len(labels))
         rng.shuffle(indices)
 
-        n_total = len(y)
-        n_test = int(n_total * self.test_split)
-        n_val = int(n_total * self.val_split)
+        n = len(labels)
+        n_test = max(1, int(n * self.test_split))
+        n_val  = max(1, int(n * self.val_split))
 
-        test_idx = indices[:n_test]
-        val_idx = indices[n_test : n_test + n_val]
+        test_idx  = indices[:n_test]
+        val_idx   = indices[n_test : n_test + n_val]
         train_idx = indices[n_test + n_val :]
 
-        return (
-            NPPADDataset(X[train_idx], y[train_idx]),
-            NPPADDataset(X[val_idx], y[val_idx]),
-            NPPADDataset(X[test_idx], y[test_idx]),
-        )
+        def subset(idx_arr):
+            return (
+                [samples[i] for i in idx_arr],
+                [labels[i] for i in idx_arr],
+            )
+
+        train_s, train_l = subset(train_idx)
+        val_s,   val_l   = subset(val_idx)
+        test_s,  test_l  = subset(test_idx)
+
+        return train_s, train_l, val_s, val_l, test_s, test_l
