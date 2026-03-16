@@ -1,0 +1,12 @@
+# Core
+torch>=2.0.0
+pytorch-lightning>=2.0.0
+numpy>=1.24.0
+polars>=0.20.0
+
+# Elliptic Envelope head
+scikit-learn>=1.3.0
+
+# XAI
+shap>=0.42.0
+matplotlib>=3.7.0
