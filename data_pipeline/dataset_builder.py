@@ -275,9 +275,9 @@ class NPPADDataModule(pl.LightningDataModule):
         )
         cleaned: List[np.ndarray] = []
         for arr in np_samples:
-            import pandas as pd
-            df_tmp = pd.DataFrame(arr)
-            cleaned.append(cleaner.clean(df_tmp).values.astype(np.float32))
+            df_tmp = pl_lib.DataFrame(arr)
+            # clean() returns a pl.DataFrame, and .to_numpy() gets the float32 array
+            cleaned.append(cleaner.clean(df_tmp).to_numpy().astype(np.float32))
         logger.info("Cleaning complete.")
 
         # 3. Scale ----------------------------------------------------------
