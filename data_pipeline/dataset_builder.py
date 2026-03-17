@@ -84,8 +84,12 @@ class NPPADDataset(Dataset):
         self.window_size = window_size
         self.stride = stride
 
-        # Store samples as float32 tensors to avoid repeated conversion.
-        self.samples: List[torch.Tensor] = []
+        # Store samples as raw numpy arrays (NOT torch tensors).
+        # torch.from_numpy() shares non-resizable storage with numpy,
+        # which causes "Trying to resize storage" errors in the
+        # DataLoader collate function.  We create fresh tensors on
+        # demand inside __getitem__ instead.
+        self.samples: List[np.ndarray] = []
         self.sample_labels: List[int] = []
 
         # For each sample, compute how many windows it yields and build
@@ -93,7 +97,7 @@ class NPPADDataset(Dataset):
         window_counts: List[int] = []
 
         for arr, lbl in zip(samples, labels):
-            arr = np.asarray(arr, dtype=np.float32)
+            arr = np.ascontiguousarray(arr, dtype=np.float32)
             T = arr.shape[0]
             if T < window_size:
                 logger.debug(
@@ -102,7 +106,7 @@ class NPPADDataset(Dataset):
                 )
                 continue
             n_windows = (T - window_size) // stride + 1
-            self.samples.append(torch.from_numpy(arr))
+            self.samples.append(arr)
             self.sample_labels.append(lbl)
             window_counts.append(n_windows)
 
@@ -156,10 +160,11 @@ class NPPADDataset(Dataset):
         sample_idx = int(np.searchsorted(self._cum_windows, idx + 1, side="right")) - 1
         window_offset = (idx - int(self._cum_windows[sample_idx])) * self.stride
 
-        arr = self.samples[sample_idx]          # (T, F)
+        arr = self.samples[sample_idx]          # numpy (T, F)
         window = arr[window_offset : window_offset + self.window_size]   # (I, F)
 
-        x = window.T.contiguous().clone()       # (F, I) — own storage for collate
+        # Create brand-new tensors (NOT from_numpy) → resizable storage
+        x = torch.tensor(window.T.copy(), dtype=torch.float32)   # (F, I)
         y = torch.tensor(self.sample_labels[sample_idx], dtype=torch.long)
         return x, y
 
