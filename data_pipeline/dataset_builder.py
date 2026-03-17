@@ -159,7 +159,7 @@ class NPPADDataset(Dataset):
         arr = self.samples[sample_idx]          # (T, F)
         window = arr[window_offset : window_offset + self.window_size]   # (I, F)
 
-        x = window.T.contiguous()              # (F, I) — channels-first
+        x = window.T.contiguous().clone()       # (F, I) — own storage for collate
         y = torch.tensor(self.sample_labels[sample_idx], dtype=torch.long)
         return x, y
 
