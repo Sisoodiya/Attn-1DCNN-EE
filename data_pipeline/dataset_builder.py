@@ -291,16 +291,15 @@ class NPPADDataModule(pl.LightningDataModule):
                 "Use 'zscore' or 'minmax'."
             )
 
-        # Fit on all data then transform each array in-place
-        import pandas as pd
-        all_concat = pd.DataFrame(np.vstack(cleaned))
-        scaler.fit([all_concat])          # fit_transform on concatenation
+        # Fit on all data then transform each sample
+        all_concat = pl_lib.DataFrame(np.vstack(cleaned))
+        scaler.fit([all_concat])
 
         scaled: List[np.ndarray] = []
         for arr in cleaned:
-            df_tmp = pd.DataFrame(arr)
+            df_tmp = pl_lib.DataFrame(arr)
             scaled_df = scaler.transform([df_tmp])[0]
-            scaled.append(scaled_df.values.astype(np.float32))
+            scaled.append(scaled_df.to_numpy().astype(np.float32))
 
         del cleaned  # free intermediate RAM
         logger.info("Scaling complete.")
