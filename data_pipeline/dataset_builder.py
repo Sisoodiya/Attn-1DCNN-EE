@@ -127,6 +127,20 @@ class NPPADDataset(Dataset):
     # Dataset protocol
     # ------------------------------------------------------------------
 
+    @property
+    def labels(self) -> torch.Tensor:
+        """Flat tensor of labels for every window (backward-compat).
+
+        Expands ``sample_labels`` so that each sample's label is repeated
+        for every window that sample produces.  The result has shape
+        ``(total_windows,)`` and dtype ``torch.long``.
+        """
+        expanded: List[torch.Tensor] = []
+        for i, lbl in enumerate(self.sample_labels):
+            n_win = int(self._cum_windows[i + 1] - self._cum_windows[i])
+            expanded.append(torch.full((n_win,), lbl, dtype=torch.long))
+        return torch.cat(expanded)
+
     def __len__(self) -> int:
         return self._total_windows
 
