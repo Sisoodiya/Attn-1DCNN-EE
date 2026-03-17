@@ -49,7 +49,6 @@ except ImportError:
 from data_pipeline.data_loader import NPPADDataLoader
 from data_pipeline.data_cleaning import DataCleaner
 from data_pipeline.scaler import ZScoreScaler, MinMaxScaler
-from data_pipeline.sliding_window import SlidingWindowTransformer
 
 
 # ======================================================================
