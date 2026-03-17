@@ -77,7 +77,7 @@ class Attn1DCNN_EE(pl.LightningModule):
     def __init__(
         self,
         in_channels: int = 96,
-        num_classes: int = 18,
+        num_classes: int = 13,
         backbone_channels: Optional[List[int]] = None,
         backbone_kernel_sizes: int | List[int] = 3,
         lr: float = 1e-3,

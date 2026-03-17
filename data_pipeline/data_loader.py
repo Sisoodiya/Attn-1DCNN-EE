@@ -43,10 +43,12 @@ class NPPADDataLoader:
     """
 
     # Default ordering of NPPAD accident types for reproducible label encoding.
+    # Updated to match the 13 classes actually present in the Operation_csv_data directory
     DEFAULT_ACCIDENT_ORDER: List[str] = [
-        "Normal", "LOCA", "LOCAC", "SLBIC", "SLBOC", "SP", "LACP",
-        "LOF", "ATWS", "TT", "SGATR", "SGBTR", "RW", "RI",
-        "FLB", "MD", "LR", "LLB",
+        "Normal",  # Even if missing, good to keep at idx 0 if it ever arrives
+        "FLB", "LLB", "LOCA", "LOCAC", "LR",
+        "MD", "RI", "RW", "SGATR", "SGBTR",
+        "SLBIC", "SLBOC", "TT",
     ]
 
     def __init__(self, data_dir: str | Path, time_col: str = "TIME") -> None:
