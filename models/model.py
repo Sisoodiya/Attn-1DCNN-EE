@@ -64,11 +64,17 @@ class Attn1DCNN_EE(pl.LightningModule):
     backbone_kernel_sizes : list[int] | int
         Kernel size(s) for the backbone.  Default ``3``.
     lr : float
-        Learning rate for AdamW.  Default ``1e-3``.
+        Learning rate for the selected optimizer.  Default ``1e-3``.
     weight_decay : float
-        AdamW weight decay.  Default ``1e-4``.
+        Weight decay for Adam/AdamW.  Default ``1e-4``.
+    optimizer : str
+        Optimizer name: ``"adamw"``, ``"adam"``, or ``"rmsprop"``.
     scheduler : str
-        LR scheduler: ``"cosine"`` or ``"none"``.  Default ``"cosine"``.
+        LR scheduler: ``"cosine"``, ``"exponential"``, or ``"none"``.
+    cosine_min_lr : float
+        Minimum LR for cosine annealing.
+    scheduler_gamma : float
+        Decay factor for exponential scheduler.
     ee_contamination : float
         Contamination factor for the Elliptic Envelope (Phase 2).
         Default ``0.01``.
@@ -93,7 +99,10 @@ class Attn1DCNN_EE(pl.LightningModule):
         backbone_kernel_sizes: int | List[int] = 3,
         lr: float = 1e-3,
         weight_decay: float = 1e-4,
+        optimizer: str = "adamw",
         scheduler: str = "cosine",
+        cosine_min_lr: float = 1e-6,
+        scheduler_gamma: float = 0.98,
         ee_contamination: float = 0.01,
         ee_support_fraction: Optional[float] = None,
         backbone_dropout: float = 0.0,
@@ -199,22 +208,59 @@ class Attn1DCNN_EE(pl.LightningModule):
         return loss
 
     def configure_optimizers(self) -> dict:
-        optimizer = torch.optim.AdamW(
-            self.parameters(),
-            lr=self.hparams.lr,
-            weight_decay=self.hparams.weight_decay,
-        )
+        opt_name = str(self.hparams.optimizer).lower()
+        if opt_name == "adamw":
+            optimizer = torch.optim.AdamW(
+                self.parameters(),
+                lr=self.hparams.lr,
+                weight_decay=self.hparams.weight_decay,
+            )
+        elif opt_name == "adam":
+            optimizer = torch.optim.Adam(
+                self.parameters(),
+                lr=self.hparams.lr,
+                weight_decay=self.hparams.weight_decay,
+            )
+        elif opt_name == "rmsprop":
+            optimizer = torch.optim.RMSprop(
+                self.parameters(),
+                lr=self.hparams.lr,
+                alpha=0.99,
+                momentum=0.9,
+            )
+        else:
+            raise ValueError(
+                f"Unknown optimizer '{self.hparams.optimizer}'. "
+                "Use 'adamw', 'adam', or 'rmsprop'."
+            )
+
         config: Dict[str, Any] = {"optimizer": optimizer}
 
-        if self.hparams.scheduler == "cosine":
+        scheduler_name = str(self.hparams.scheduler).lower()
+        if scheduler_name == "cosine":
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer,
-                T_max=self.trainer.max_epochs,
+                T_max=max(1, int(self.trainer.max_epochs)),
+                eta_min=float(self.hparams.cosine_min_lr),
             )
             config["lr_scheduler"] = {
                 "scheduler": scheduler,
                 "interval": "epoch",
             }
+        elif scheduler_name == "exponential":
+            scheduler = torch.optim.lr_scheduler.ExponentialLR(
+                optimizer,
+                gamma=float(self.hparams.scheduler_gamma),
+            )
+            config["lr_scheduler"] = {
+                "scheduler": scheduler,
+                "interval": "epoch",
+            }
+        elif scheduler_name != "none":
+            raise ValueError(
+                f"Unknown scheduler '{self.hparams.scheduler}'. "
+                "Use 'cosine', 'exponential', or 'none'."
+            )
 
         return config
 

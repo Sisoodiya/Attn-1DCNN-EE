@@ -11,3 +11,6 @@ scikit-learn>=1.3.0
 # XAI
 shap>=0.42.0
 matplotlib>=3.7.0
+
+# Tuning / validation
+optuna>=3.6.0
