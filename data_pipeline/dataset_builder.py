@@ -161,11 +161,20 @@ class NPPADDataset(Dataset):
             )
 
         # Binary search: which sample does this global index fall in?
-        sample_idx = int(np.searchsorted(self._cum_windows, idx + 1, side="right")) - 1
+        # Use idx (not idx + 1) so boundary indices map to the correct sample.
+        sample_idx = int(np.searchsorted(self._cum_windows, idx, side="right")) - 1
         window_offset = (idx - int(self._cum_windows[sample_idx])) * self.stride
 
         arr = self.samples[sample_idx]          # numpy (T, F)
         window = arr[window_offset : window_offset + self.window_size]   # (I, F)
+
+        if window.shape[0] != self.window_size:
+            raise RuntimeError(
+                "Invalid window slice in NPPADDataset.__getitem__: "
+                f"idx={idx}, sample_idx={sample_idx}, "
+                f"offset={window_offset}, got window shape={window.shape}, "
+                f"expected (*, {self.window_size})."
+            )
 
         # Allocate fresh tensor storage explicitly. This avoids collate
         # failures from non-resizable storage in multi-worker loaders.

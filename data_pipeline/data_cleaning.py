@@ -74,7 +74,7 @@ class DataCleaner:
         pl.DataFrame
             DataFrame with no remaining NaN / null values.
         """
-        n_null = df.null_count().sum_horizontal().item()
+        n_null = self._null_cells(df)
         n_nan = sum(
             df.select(pl.col(c).is_nan().sum()).item()
             for c in df.columns
@@ -99,13 +99,19 @@ class DataCleaner:
         )
 
         if self.nan_strategy == "interpolate":
-            df = df.with_columns(pl.all().interpolate())
+            # Interpolation alone does not fill edge-null regions.
+            df = df.with_columns(
+                pl.all().interpolate().forward_fill().backward_fill()
+            )
         else:  # ffill
             df = df.with_columns(pl.all().forward_fill().backward_fill())
 
         # Safety: fill any residual nulls with 0
-        if df.null_count().sum_horizontal().item() > 0:
-            logger.warning("Residual null values filled with 0.")
+        residual_nulls = self._null_cells(df)
+        if residual_nulls > 0:
+            logger.warning(
+                "Residual null values (%d) filled with 0.", residual_nulls
+            )
             df = df.fill_null(0.0)
 
         return df
@@ -168,8 +174,17 @@ class DataCleaner:
                 self.z_threshold,
             )
             df = df.with_columns(exprs)
-            df = df.with_columns(pl.all().interpolate())
-            df = df.fill_null(0.0)
+            df = df.with_columns(
+                pl.all().interpolate().forward_fill().backward_fill()
+            )
+            residual_nulls = self._null_cells(df)
+            if residual_nulls > 0:
+                logger.warning(
+                    "Residual null values after outlier interpolation (%d) "
+                    "filled with 0.",
+                    residual_nulls,
+                )
+                df = df.fill_null(0.0)
 
         return df
 
@@ -212,3 +227,12 @@ class DataCleaner:
             cleaned.append(self.clean(df))
         logger.info("Cleaned %d samples", len(cleaned))
         return cleaned
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _null_cells(df: pl.DataFrame) -> int:
+        """Return the total number of null cells in a DataFrame."""
+        return int(sum(df[c].null_count() for c in df.columns))

@@ -81,6 +81,24 @@ class NPPADDataLoader:
         filepath = Path(filepath)
         logger.debug("Loading %s", filepath)
         df = pl.read_csv(filepath)
+
+        # Normalise column names and drop unnamed index-like columns
+        # that appear in some CSV exports.
+        normalized_cols = [c.replace("\ufeff", "").strip() for c in df.columns]
+        if normalized_cols != df.columns:
+            df.columns = normalized_cols
+
+        drop_cols = [
+            c for c in df.columns
+            if c == "" or c.lower().startswith("unnamed")
+        ]
+        if drop_cols:
+            logger.debug(
+                "Dropping %d unnamed/index-like columns from %s: %s",
+                len(drop_cols), filepath.name, drop_cols,
+            )
+            df = df.drop(drop_cols)
+
         return df
 
     def load_accident_type(
@@ -160,23 +178,52 @@ class NPPADDataLoader:
                 samples.append(df)
                 labels.append(label_id)
 
-        # Enforce a consistent column set across all samples.
-        # Some CSVs may have extra columns; keep only the intersection.
+        # Enforce a consistent column schema across all samples.
         if samples:
-            common_cols = set(samples[0].columns)
-            for df in samples[1:]:
-                common_cols &= set(df.columns)
-            common_cols_sorted = [
-                c for c in samples[0].columns if c in common_cols
-            ]
-            if any(len(df.columns) != len(common_cols_sorted) for df in samples):
+            reference_cols = samples[0].columns
+            ref_set = set(reference_cols)
+
+            aligned_samples: List[pl.DataFrame] = []
+            mismatched = 0
+            added_total = 0
+            dropped_total = 0
+
+            for df in samples:
+                cols_set = set(df.columns)
+                missing = [c for c in reference_cols if c not in cols_set]
+                extra = [c for c in df.columns if c not in ref_set]
+
+                if missing or extra:
+                    mismatched += 1
+                    added_total += len(missing)
+                    dropped_total += len(extra)
+
+                    if extra:
+                        df = df.drop(extra)
+                    if missing:
+                        df = df.with_columns(
+                            pl.lit(None).cast(pl.Float32).alias(c)
+                            for c in missing
+                        )
+
+                # Ensure deterministic order for downstream numpy conversion.
+                if df.columns != reference_cols:
+                    df = df.select(reference_cols)
+
+                aligned_samples.append(df)
+
+            if mismatched > 0:
                 logger.warning(
-                    "Column count varies across CSVs; "
-                    "keeping %d common columns out of max %d",
-                    len(common_cols_sorted),
-                    max(len(df.columns) for df in samples),
+                    "Column schema varies across CSVs; aligned %d/%d samples "
+                    "to a %d-column reference schema (added=%d, dropped=%d).",
+                    mismatched,
+                    len(samples),
+                    len(reference_cols),
+                    added_total,
+                    dropped_total,
                 )
-                samples = [df.select(common_cols_sorted) for df in samples]
+
+            samples = aligned_samples
 
         logger.info(
             "Total: %d samples across %d classes", len(samples), len(label_map)
