@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -40,11 +40,11 @@ from torch.utils.data import DataLoader, Dataset
 
 logger = logging.getLogger(__name__)
 
-# Attempt to import pytorch_lightning; fall back to lightning.pytorch.
+# Lightning import (compatible with both package names).
 try:
-    import pytorch_lightning as pl
-except ImportError:
     import lightning.pytorch as pl  # type: ignore[no-redef]
+except ImportError:
+    import pytorch_lightning as pl
 
 from data_pipeline.data_loader import NPPADDataLoader
 from data_pipeline.data_cleaning import DataCleaner
@@ -155,6 +155,10 @@ class NPPADDataset(Dataset):
         """
         if idx < 0:
             idx = self._total_windows + idx
+        if idx < 0 or idx >= self._total_windows:
+            raise IndexError(
+                f"Index out of range: {idx} (dataset size: {self._total_windows})"
+            )
 
         # Binary search: which sample does this global index fall in?
         sample_idx = int(np.searchsorted(self._cum_windows, idx + 1, side="right")) - 1
@@ -163,8 +167,11 @@ class NPPADDataset(Dataset):
         arr = self.samples[sample_idx]          # numpy (T, F)
         window = arr[window_offset : window_offset + self.window_size]   # (I, F)
 
-        # Create brand-new tensors (NOT from_numpy) → resizable storage
-        x = torch.tensor(window.T.copy(), dtype=torch.float32)   # (F, I)
+        # Allocate fresh tensor storage explicitly. This avoids collate
+        # failures from non-resizable storage in multi-worker loaders.
+        x_np = np.ascontiguousarray(window.T, dtype=np.float32)  # (F, I)
+        x = torch.empty((x_np.shape[0], x_np.shape[1]), dtype=torch.float32)
+        x.copy_(torch.from_numpy(x_np))
         y = torch.tensor(self.sample_labels[sample_idx], dtype=torch.long)
         return x, y
 
@@ -298,7 +305,13 @@ class NPPADDataModule(pl.LightningDataModule):
             cleaned.append(cleaner.clean(df_tmp).to_numpy().astype(np.float32))
         logger.info("Cleaning complete.")
 
-        # 3. Scale ----------------------------------------------------------
+        # 3. Split (sample-level, stratified) -------------------------------
+        train_samples, train_labels, val_samples, val_labels, \
+            test_samples, test_labels = self._stratified_split(cleaned, labels)
+
+        del cleaned  # free intermediate RAM
+
+        # 4. Scale (fit on train only to avoid leakage) ---------------------
         if self.scaler_type == "zscore":
             scaler: ZScoreScaler | MinMaxScaler = ZScoreScaler()
         elif self.scaler_type == "minmax":
@@ -309,34 +322,23 @@ class NPPADDataModule(pl.LightningDataModule):
                 "Use 'zscore' or 'minmax'."
             )
 
-        # Fit on all data then transform each sample
-        all_concat = pl_lib.DataFrame(np.vstack(cleaned))
-        scaler.fit([all_concat])
+        train_df = [pl_lib.DataFrame(arr) for arr in train_samples]
+        scaler.fit(train_df)
 
-        scaled: List[np.ndarray] = []
-        for arr in cleaned:
-            df_tmp = pl_lib.DataFrame(arr)
-            scaled_df = scaler.transform([df_tmp])[0]
-            scaled.append(scaled_df.to_numpy().astype(np.float32))
-
-        del cleaned  # free intermediate RAM
+        train_scaled = self._transform_with_scaler(train_samples, scaler)
+        val_scaled = self._transform_with_scaler(val_samples, scaler)
+        test_scaled = self._transform_with_scaler(test_samples, scaler)
         logger.info("Scaling complete.")
-
-        # 4. Sample-level split (BEFORE windowing — keeps split clean) ------
-        train_samples, train_labels, val_samples, val_labels, \
-            test_samples, test_labels = self._stratified_split(scaled, labels)
-
-        del scaled  # free memory
 
         # 5. Build lazy Datasets -------------------------------------------
         self.train_dataset = NPPADDataset(
-            train_samples, train_labels, self.window_size, self.stride
+            train_scaled, train_labels, self.window_size, self.stride
         )
         self.val_dataset = NPPADDataset(
-            val_samples, val_labels, self.window_size, self.stride
+            val_scaled, val_labels, self.window_size, self.stride
         )
         self.test_dataset = NPPADDataset(
-            test_samples, test_labels, self.window_size, self.stride
+            test_scaled, test_labels, self.window_size, self.stride
         )
 
         logger.info(
@@ -353,7 +355,7 @@ class NPPADDataModule(pl.LightningDataModule):
             shuffle=True,
             num_workers=self.num_workers,
             pin_memory=torch.cuda.is_available(),
-            drop_last=True,
+            drop_last=False,
             persistent_workers=self.num_workers > 0,
         )
 
@@ -385,28 +387,80 @@ class NPPADDataModule(pl.LightningDataModule):
         self,
         samples: List[np.ndarray],
         labels: List[int],
-    ) -> tuple:
-        """Sample-level stratified shuffle-split → train / val / test."""
-        rng = np.random.RandomState(self.random_seed)
-        indices = np.arange(len(labels))
-        rng.shuffle(indices)
+    ) -> Tuple[
+        List[np.ndarray], List[int],
+        List[np.ndarray], List[int],
+        List[np.ndarray], List[int],
+    ]:
+        """Sample-level stratified shuffle-split → train / val / test.
 
-        n = len(labels)
-        n_test = max(1, int(n * self.test_split))
-        n_val  = max(1, int(n * self.val_split))
-
-        test_idx  = indices[:n_test]
-        val_idx   = indices[n_test : n_test + n_val]
-        train_idx = indices[n_test + n_val :]
-
-        def subset(idx_arr):
-            return (
-                [samples[i] for i in idx_arr],
-                [labels[i] for i in idx_arr],
+        Keeps per-class proportions approximately consistent across splits.
+        """
+        if len(samples) != len(labels):
+            raise ValueError(
+                f"samples ({len(samples)}) and labels ({len(labels)}) must match"
             )
 
+        rng = np.random.RandomState(self.random_seed)
+        labels_np = np.asarray(labels, dtype=np.int64)
+
+        train_idx: List[int] = []
+        val_idx: List[int] = []
+        test_idx: List[int] = []
+
+        for cls in np.unique(labels_np):
+            cls_idx = np.where(labels_np == cls)[0]
+            rng.shuffle(cls_idx)
+            n_cls = len(cls_idx)
+
+            n_test = int(np.floor(n_cls * self.test_split))
+            n_val = int(np.floor(n_cls * self.val_split))
+
+            # Try to preserve at least one sample in split when feasible.
+            if self.test_split > 0 and n_test == 0 and n_cls >= 3:
+                n_test = 1
+            if self.val_split > 0 and n_val == 0 and (n_cls - n_test) >= 2:
+                n_val = 1
+
+            # Always leave at least one sample for train.
+            while n_test + n_val >= n_cls and (n_test > 0 or n_val > 0):
+                if n_val > 0:
+                    n_val -= 1
+                else:
+                    n_test -= 1
+
+            test_part = cls_idx[:n_test]
+            val_part = cls_idx[n_test : n_test + n_val]
+            train_part = cls_idx[n_test + n_val :]
+
+            test_idx.extend(test_part.tolist())
+            val_idx.extend(val_part.tolist())
+            train_idx.extend(train_part.tolist())
+
+        rng.shuffle(train_idx)
+        rng.shuffle(val_idx)
+        rng.shuffle(test_idx)
+
+        def subset(idx_arr: Sequence[int]) -> Tuple[List[np.ndarray], List[int]]:
+            return [samples[i] for i in idx_arr], [labels[i] for i in idx_arr]
+
         train_s, train_l = subset(train_idx)
-        val_s,   val_l   = subset(val_idx)
-        test_s,  test_l  = subset(test_idx)
+        val_s, val_l = subset(val_idx)
+        test_s, test_l = subset(test_idx)
 
         return train_s, train_l, val_s, val_l, test_s, test_l
+
+    @staticmethod
+    def _transform_with_scaler(
+        arrays: List[np.ndarray],
+        scaler: ZScoreScaler | MinMaxScaler,
+    ) -> List[np.ndarray]:
+        """Transform a list of arrays with a fitted scaler."""
+        import polars as pl_lib
+
+        out: List[np.ndarray] = []
+        for arr in arrays:
+            df_tmp = pl_lib.DataFrame(arr)
+            scaled_df = scaler.transform([df_tmp])[0]
+            out.append(scaled_df.to_numpy().astype(np.float32))
+        return out

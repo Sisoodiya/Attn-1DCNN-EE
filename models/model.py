@@ -38,9 +38,9 @@ from torch.utils.data import DataLoader
 
 # Lightning import (compatible with both package names)
 try:
-    import pytorch_lightning as pl
-except ImportError:
     import lightning.pytorch as pl  # type: ignore[no-redef]
+except ImportError:
+    import pytorch_lightning as pl
 
 from models.cnn_backbone import CNN1DBackbone
 from models.attention import SoftAttention
@@ -254,6 +254,11 @@ class Attn1DCNN_EE(pl.LightningModule):
             The fitted EE head (also stored as ``self.ee_head``).
         """
         logger.info("Phase 2: extracting features for EE fitting ...")
+        if getattr(dataloader, "drop_last", False):
+            logger.warning(
+                "fit_envelope() received a dataloader with drop_last=True; "
+                "some training windows will be excluded from EE fitting."
+            )
         features, labels = self.extract_features(dataloader)
         logger.info(
             "Extracted features: %s, labels: %s", features.shape, labels.shape
