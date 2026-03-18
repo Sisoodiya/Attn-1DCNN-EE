@@ -38,6 +38,7 @@ naturally.
 from __future__ import annotations
 
 import logging
+import warnings
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -97,6 +98,7 @@ class EllipticEnvelopeHead:
         self,
         contamination: float = 0.01,
         random_state: int = 42,
+        support_fraction: Optional[float] = None,
     ) -> None:
         if _SklearnEE is None:
             raise ImportError(
@@ -105,6 +107,7 @@ class EllipticEnvelopeHead:
             )
         self.contamination = contamination
         self.random_state = random_state
+        self.support_fraction = support_fraction
 
         # Populated by fit()
         self.envelopes_: Dict[int, _SklearnEE] = {}
@@ -162,12 +165,54 @@ class EllipticEnvelopeHead:
             ee = _SklearnEE(
                 contamination=self.contamination,
                 random_state=self.random_state,
+                support_fraction=self.support_fraction,
             )
-            ee.fit(cls_features)
+
+            # FastMCD may emit repetitive determinant-increase warnings on
+            # some high-dimensional class distributions. Retry once with a
+            # higher support_fraction for numerical stability.
+            retried_with_higher_support = False
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", RuntimeWarning)
+                ee.fit(cls_features)
+
+            det_warn = any(
+                isinstance(w.message, RuntimeWarning)
+                and "Determinant has increased" in str(w.message)
+                for w in caught
+            )
+
+            if det_warn:
+                retry_support = 0.8 if self.support_fraction is None else max(
+                    self.support_fraction, 0.8
+                )
+                logger.warning(
+                    "Class %s: FastMCD determinant warning detected; "
+                    "retrying EllipticEnvelope with support_fraction=%.2f",
+                    cls_name,
+                    retry_support,
+                )
+                ee = _SklearnEE(
+                    contamination=self.contamination,
+                    random_state=self.random_state,
+                    support_fraction=retry_support,
+                )
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore",
+                        message="Determinant has increased; this should not happen.*",
+                        category=RuntimeWarning,
+                    )
+                    ee.fit(cls_features)
+                retried_with_higher_support = True
+
             self.envelopes_[cls_id] = ee
             logger.info(
-                "Class %s: fitted envelope on %d samples (%d dims)",
-                cls_name, n_samples, n_dims,
+                "Class %s: fitted envelope on %d samples (%d dims)%s",
+                cls_name,
+                n_samples,
+                n_dims,
+                " [retry support_fraction]" if retried_with_higher_support else "",
             )
 
         self.fitted_ = True

@@ -72,6 +72,9 @@ class Attn1DCNN_EE(pl.LightningModule):
     ee_contamination : float
         Contamination factor for the Elliptic Envelope (Phase 2).
         Default ``0.01``.
+    ee_support_fraction : float | None
+        Support fraction for the FastMCD estimator used by EllipticEnvelope.
+        Increase (e.g. ``0.7``–``0.9``) for numerical stability.
     classifier_dropout : float
         Dropout probability applied before the linear classifier.
     label_smoothing : float
@@ -90,6 +93,7 @@ class Attn1DCNN_EE(pl.LightningModule):
         weight_decay: float = 1e-4,
         scheduler: str = "cosine",
         ee_contamination: float = 0.01,
+        ee_support_fraction: Optional[float] = None,
         classifier_dropout: float = 0.2,
         label_smoothing: float = 0.0,
         class_weights: Optional[List[float]] = None,
@@ -285,6 +289,7 @@ class Attn1DCNN_EE(pl.LightningModule):
 
         self.ee_head = EllipticEnvelopeHead(
             contamination=self.hparams.ee_contamination,
+            support_fraction=self.hparams.ee_support_fraction,
         )
         self.ee_head.fit(features, labels, label_map=label_map)
 
