@@ -11,7 +11,7 @@ sequential bottleneck of RNNs.
 
 Architecture per convolutional block
 ------------------------------------
-    Conv1d  →  BatchNorm1d  →  ReLU
+    Conv1d  →  BatchNorm1d  →  ReLU  →  Dropout1d
 
 Design decisions
 ----------------
@@ -54,6 +54,8 @@ class ConvBlock(nn.Module):
         Number of convolution filters (output channels).
     kernel_size : int
         Temporal extent of the 1D kernel (default ``3``).
+    dropout : float
+        Dropout probability applied after ReLU (default ``0.0``).
     """
 
     def __init__(
@@ -61,6 +63,7 @@ class ConvBlock(nn.Module):
         in_channels: int,
         out_channels: int,
         kernel_size: int = 3,
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
 
@@ -74,6 +77,9 @@ class ConvBlock(nn.Module):
         )
         self.bn = nn.BatchNorm1d(out_channels)
         self.relu = nn.ReLU(inplace=True)
+        self.dropout = (
+            nn.Dropout1d(p=dropout) if dropout > 0.0 else nn.Identity()
+        )
 
         # --- Kaiming (He) initialisation for ReLU -----------------------
         nn.init.kaiming_normal_(
@@ -82,7 +88,7 @@ class ConvBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """``(B, C_in, L) → (B, C_out, L)``."""
-        return self.relu(self.bn(self.conv(x)))
+        return self.dropout(self.relu(self.bn(self.conv(x))))
 
 
 # ======================================================================
@@ -107,6 +113,8 @@ class CNN1DBackbone(nn.Module):
     kernel_sizes : list[int] | int
         Kernel size(s).  A single int is broadcast to every block.
         Default ``3``.
+    dropout : float
+        Dropout probability applied in every convolution block.
     """
 
     def __init__(
@@ -114,6 +122,7 @@ class CNN1DBackbone(nn.Module):
         in_channels: int = 96,
         channel_sizes: Optional[List[int]] = None,
         kernel_sizes: int | List[int] = 3,
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
 
@@ -132,7 +141,9 @@ class CNN1DBackbone(nn.Module):
         blocks: list[ConvBlock] = []
         prev_ch = in_channels
         for out_ch, ks in zip(channel_sizes, kernel_sizes):
-            blocks.append(ConvBlock(prev_ch, out_ch, kernel_size=ks))
+            blocks.append(
+                ConvBlock(prev_ch, out_ch, kernel_size=ks, dropout=dropout)
+            )
             prev_ch = out_ch
 
         self.blocks = nn.Sequential(*blocks)

@@ -36,7 +36,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 logger = logging.getLogger(__name__)
 
@@ -80,9 +80,13 @@ class NPPADDataset(Dataset):
         labels: List[int],
         window_size: int = 50,
         stride: int = 1,
+        noise_std: float = 0.0,
+        gain_std: float = 0.0,
     ) -> None:
         self.window_size = window_size
         self.stride = stride
+        self.noise_std = noise_std
+        self.gain_std = gain_std
 
         # Store samples as raw numpy arrays (NOT torch tensors).
         # torch.from_numpy() shares non-resizable storage with numpy,
@@ -181,6 +185,16 @@ class NPPADDataset(Dataset):
         x_np = np.ascontiguousarray(window.T, dtype=np.float32)  # (F, I)
         x = torch.empty((x_np.shape[0], x_np.shape[1]), dtype=torch.float32)
         x.copy_(torch.from_numpy(x_np))
+        if self.gain_std > 0.0:
+            gain = torch.normal(
+                mean=1.0,
+                std=self.gain_std,
+                size=(1,),
+                dtype=torch.float32,
+            ).clamp_(min=0.8, max=1.2)
+            x.mul_(gain.item())
+        if self.noise_std > 0.0:
+            x.add_(torch.randn_like(x) * self.noise_std)
         y = torch.tensor(self.sample_labels[sample_idx], dtype=torch.long)
         return x, y
 
@@ -229,6 +243,15 @@ class NPPADDataModule(pl.LightningDataModule):
         Subset of accident types to load.  ``None`` loads all 18.
     random_seed : int
         Seed for reproducible shuffling and splitting.  Default ``42``.
+    use_weighted_sampler : bool
+        If ``True``, uses ``WeightedRandomSampler`` in the training
+        dataloader to mitigate class imbalance at window level.
+    train_noise_std : float
+        Standard deviation of Gaussian noise augmentation for training
+        windows.
+    train_gain_std : float
+        Standard deviation of random gain augmentation for training
+        windows.
     """
 
     def __init__(
@@ -245,6 +268,9 @@ class NPPADDataModule(pl.LightningDataModule):
         scaler_type: str = "zscore",
         accident_types: Optional[List[str]] = None,
         random_seed: int = 42,
+        use_weighted_sampler: bool = False,
+        train_noise_std: float = 0.0,
+        train_gain_std: float = 0.0,
     ) -> None:
         super().__init__()
         self.data_dir = Path(data_dir)
@@ -259,6 +285,9 @@ class NPPADDataModule(pl.LightningDataModule):
         self.scaler_type = scaler_type
         self.accident_types = accident_types
         self.random_seed = random_seed
+        self.use_weighted_sampler = use_weighted_sampler
+        self.train_noise_std = train_noise_std
+        self.train_gain_std = train_gain_std
 
         # Populated during setup().
         self.train_dataset: Optional[NPPADDataset] = None
@@ -346,7 +375,12 @@ class NPPADDataModule(pl.LightningDataModule):
 
         # 5. Build lazy Datasets -------------------------------------------
         self.train_dataset = NPPADDataset(
-            train_scaled, train_labels, self.window_size, self.stride
+            train_scaled,
+            train_labels,
+            self.window_size,
+            self.stride,
+            noise_std=self.train_noise_std,
+            gain_std=self.train_gain_std,
         )
         self.val_dataset = NPPADDataset(
             val_scaled, val_labels, self.window_size, self.stride
@@ -364,10 +398,26 @@ class NPPADDataModule(pl.LightningDataModule):
         self._is_setup = True
 
     def train_dataloader(self) -> DataLoader:
+        sampler = None
+        shuffle = True
+        if self.use_weighted_sampler:
+            labels = self.train_dataset.labels.numpy()
+            class_counts = np.bincount(labels, minlength=self.num_classes)
+            class_counts = np.maximum(class_counts, 1)
+            class_weights = labels.size / (self.num_classes * class_counts)
+            sample_weights = class_weights[labels]
+            sampler = WeightedRandomSampler(
+                weights=torch.as_tensor(sample_weights, dtype=torch.double),
+                num_samples=len(sample_weights),
+                replacement=True,
+            )
+            shuffle = False
+
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
-            shuffle=True,
+            shuffle=shuffle,
+            sampler=sampler,
             num_workers=self.num_workers,
             pin_memory=torch.cuda.is_available(),
             drop_last=False,

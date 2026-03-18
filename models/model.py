@@ -75,6 +75,8 @@ class Attn1DCNN_EE(pl.LightningModule):
     ee_support_fraction : float | None
         Support fraction for the FastMCD estimator used by EllipticEnvelope.
         Increase (e.g. ``0.7``–``0.9``) for numerical stability.
+    backbone_dropout : float
+        Dropout applied inside each CNN backbone block.
     classifier_dropout : float
         Dropout probability applied before the linear classifier.
     label_smoothing : float
@@ -94,6 +96,7 @@ class Attn1DCNN_EE(pl.LightningModule):
         scheduler: str = "cosine",
         ee_contamination: float = 0.01,
         ee_support_fraction: Optional[float] = None,
+        backbone_dropout: float = 0.0,
         classifier_dropout: float = 0.2,
         label_smoothing: float = 0.0,
         class_weights: Optional[List[float]] = None,
@@ -106,6 +109,7 @@ class Attn1DCNN_EE(pl.LightningModule):
             in_channels=in_channels,
             channel_sizes=backbone_channels,
             kernel_sizes=backbone_kernel_sizes,
+            dropout=backbone_dropout,
         )
 
         # Component 3: Soft Attention
