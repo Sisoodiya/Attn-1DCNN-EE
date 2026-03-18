@@ -267,6 +267,7 @@ class NPPADDataModule(pl.LightningDataModule):
         self.label_map: Optional[Dict[str, int]] = None
         self.num_classes: int = 0
         self.num_features: int = 0
+        self._is_setup: bool = False
 
     # ------------------------------------------------------------------
     # Lightning hooks
@@ -279,6 +280,10 @@ class NPPADDataModule(pl.LightningDataModule):
         (lazy), so this method only allocates memory proportional to
         the number of *samples* × their length, not the number of windows.
         """
+        if self._is_setup:
+            logger.info("NPPAD DataModule already set up; skipping rebuild.")
+            return
+
         logger.info("=== NPPAD DataModule setup (stage=%s) ===", stage)
 
         # 1. Load -----------------------------------------------------------
@@ -356,6 +361,7 @@ class NPPADDataModule(pl.LightningDataModule):
             len(self.val_dataset),
             len(self.test_dataset),
         )
+        self._is_setup = True
 
     def train_dataloader(self) -> DataLoader:
         return DataLoader(

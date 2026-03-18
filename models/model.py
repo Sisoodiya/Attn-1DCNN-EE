@@ -72,6 +72,12 @@ class Attn1DCNN_EE(pl.LightningModule):
     ee_contamination : float
         Contamination factor for the Elliptic Envelope (Phase 2).
         Default ``0.01``.
+    classifier_dropout : float
+        Dropout probability applied before the linear classifier.
+    label_smoothing : float
+        Label smoothing for cross-entropy (``0.0`` disables it).
+    class_weights : list[float] | None
+        Optional class weights for imbalanced supervision loss.
     """
 
     def __init__(
@@ -84,6 +90,9 @@ class Attn1DCNN_EE(pl.LightningModule):
         weight_decay: float = 1e-4,
         scheduler: str = "cosine",
         ee_contamination: float = 0.01,
+        classifier_dropout: float = 0.2,
+        label_smoothing: float = 0.0,
+        class_weights: Optional[List[float]] = None,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -101,11 +110,20 @@ class Attn1DCNN_EE(pl.LightningModule):
         # Pooling bridge: (B, C, I) → (B, C)
         self.pool = GlobalAvgPool1d()
 
+        # Regularisation before the supervised classifier.
+        self.classifier_dropout = nn.Dropout(p=classifier_dropout)
+
         # Supervised classification head (Phase 1 training)
         self.classifier = nn.Linear(self.backbone.out_channels, num_classes)
 
         # Loss
-        self.criterion = nn.CrossEntropyLoss()
+        weight_tensor: Optional[torch.Tensor] = None
+        if class_weights is not None:
+            weight_tensor = torch.tensor(class_weights, dtype=torch.float32)
+        self.criterion = nn.CrossEntropyLoss(
+            weight=weight_tensor,
+            label_smoothing=label_smoothing,
+        )
 
         # Component 4: EE head (populated by fit_envelope after Phase 1)
         self.ee_head: Optional[EllipticEnvelopeHead] = None
@@ -137,6 +155,7 @@ class Attn1DCNN_EE(pl.LightningModule):
         features = self.backbone(x)                      # (B, C, I)
         attended, attn_weights = self.attention(features) # (B, C, I), (B, I, C)
         pooled = self.pool(attended)                      # (B, C)
+        pooled = self.classifier_dropout(pooled)          # (B, C)
         logits = self.classifier(pooled)                  # (B, num_classes)
         return logits, attn_weights, pooled
 
