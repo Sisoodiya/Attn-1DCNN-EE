@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import logging
 import warnings
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -226,6 +226,47 @@ class EllipticEnvelopeHead:
     # Inference
     # ------------------------------------------------------------------
 
+    def membership_masks(
+        self,
+        features: np.ndarray,
+    ) -> Dict[int, np.ndarray]:
+        """Return inlier membership masks for every fitted envelope.
+
+        Parameters
+        ----------
+        features : np.ndarray
+            Shape ``(N, D)``.
+
+        Returns
+        -------
+        dict[int, np.ndarray]
+            ``{class_id: bool_mask}``, each mask has shape ``(N,)``.
+        """
+        self._check_fitted()
+        if not self.envelopes_:
+            return {}
+        return {
+            cls_id: ee.predict(features) == 1
+            for cls_id, ee in self.envelopes_.items()
+        }
+
+    def decision_scores(
+        self,
+        features: np.ndarray,
+    ) -> Dict[int, np.ndarray]:
+        """Return EE decision scores for every fitted class.
+
+        Positive values indicate inlier confidence, negative values
+        indicate outlier confidence.
+        """
+        self._check_fitted()
+        if not self.envelopes_:
+            return {}
+        return {
+            cls_id: ee.decision_function(features).astype(np.float64)
+            for cls_id, ee in self.envelopes_.items()
+        }
+
     def mahalanobis_distances(
         self, features: np.ndarray
     ) -> Dict[int, np.ndarray]:
@@ -248,6 +289,154 @@ class EllipticEnvelopeHead:
             for cls_id, ee in self.envelopes_.items()
         }
 
+    def predict_binary_failure(
+        self,
+        features: np.ndarray,
+        require_unique_acceptance: bool = False,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Detect reliability failure windows using envelope acceptance.
+
+        Parameters
+        ----------
+        features : np.ndarray
+            Shape ``(N, D)`` pooled feature vectors.
+        require_unique_acceptance : bool
+            If ``False`` (default), a sample is a failure when no
+            envelope accepts it.  If ``True``, any sample not accepted
+            by exactly one envelope is considered a failure.
+
+        Returns
+        -------
+        is_failure : np.ndarray
+            Shape ``(N,)`` boolean mask.
+        risk_score : np.ndarray
+            Shape ``(N,)`` non-negative risk proxy derived from the
+            best envelope decision score. Larger means riskier.
+        nearest_class : np.ndarray
+            Shape ``(N,)`` nearest class id by Mahalanobis distance.
+            ``-1`` when no envelopes are available.
+        accept_counts : np.ndarray
+            Shape ``(N,)`` number of envelopes accepting each sample.
+        """
+        self._check_fitted()
+        n = int(features.shape[0])
+        if n == 0:
+            return (
+                np.empty((0,), dtype=bool),
+                np.empty((0,), dtype=np.float64),
+                np.empty((0,), dtype=np.int64),
+                np.empty((0,), dtype=np.int32),
+            )
+
+        if not self.envelopes_:
+            return (
+                np.ones((n,), dtype=bool),
+                np.full((n,), np.inf, dtype=np.float64),
+                np.full((n,), self.UNKNOWN_LABEL, dtype=np.int64),
+                np.zeros((n,), dtype=np.int32),
+            )
+
+        memberships = self.membership_masks(features)
+        accept_counts = np.zeros((n,), dtype=np.int32)
+        for mask in memberships.values():
+            accept_counts += mask.astype(np.int32)
+
+        if require_unique_acceptance:
+            is_failure = accept_counts != 1
+        else:
+            is_failure = accept_counts == 0
+
+        # Reliability risk proxy:
+        # risk = max(0, -best decision score over class envelopes)
+        decision = self.decision_scores(features)
+        stacked_decision = np.stack(
+            [decision[cls] for cls in sorted(decision)], axis=1
+        )  # (N, C_fitted)
+        best_decision = stacked_decision.max(axis=1)
+        risk_score = np.maximum(0.0, -best_decision)
+
+        # Nearest envelope by Mahalanobis distance (for logging context)
+        dists = self.mahalanobis_distances(features)
+        cls_ids = sorted(dists)
+        stacked_dist = np.stack([dists[c] for c in cls_ids], axis=1)
+        nearest_idx = stacked_dist.argmin(axis=1)
+        nearest_class = np.asarray(
+            [cls_ids[i] for i in nearest_idx], dtype=np.int64
+        )
+
+        return is_failure, risk_score, nearest_class, accept_counts
+
+    def log_failure_events(
+        self,
+        features: np.ndarray,
+        timestamps: Sequence[Any],
+        require_unique_acceptance: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Create timestamped failure-event records.
+
+        Parameters
+        ----------
+        features : np.ndarray
+            Shape ``(N, D)`` pooled feature vectors.
+        timestamps : sequence
+            Length ``N`` operating timestamps (hours, seconds, datetime,
+            or any serialisable scalar).
+        require_unique_acceptance : bool
+            Passed to :meth:`predict_binary_failure`.
+
+        Returns
+        -------
+        list[dict]
+            One dictionary per failure event.  Each record includes:
+            ``index``, ``timestamp``, ``risk_score``, acceptance context,
+            and nearest-envelope class.
+        """
+        n = int(features.shape[0])
+        if len(timestamps) != n:
+            raise ValueError(
+                "timestamps length must match number of feature rows: "
+                f"{len(timestamps)} != {n}"
+            )
+
+        is_failure, risk_score, nearest_class, accept_counts = (
+            self.predict_binary_failure(
+                features=features,
+                require_unique_acceptance=require_unique_acceptance,
+            )
+        )
+        memberships = self.membership_masks(features) if self.envelopes_ else {}
+
+        events: List[Dict[str, Any]] = []
+        for i in np.where(is_failure)[0]:
+            accepted_class_ids = [
+                int(cls_id)
+                for cls_id, mask in memberships.items()
+                if bool(mask[i])
+            ]
+            nearest_id = int(nearest_class[i])
+
+            events.append(
+                {
+                    "index": int(i),
+                    "timestamp": self._as_scalar(timestamps[i]),
+                    "failure": True,
+                    "risk_score": float(risk_score[i]),
+                    "accept_count": int(accept_counts[i]),
+                    "accepted_class_ids": accepted_class_ids,
+                    "accepted_class_names": [
+                        self._class_name(c) for c in accepted_class_ids
+                    ],
+                    "nearest_class_id": nearest_id,
+                    "nearest_class_name": (
+                        self._class_name(nearest_id)
+                        if nearest_id != self.UNKNOWN_LABEL
+                        else "Unknown"
+                    ),
+                }
+            )
+
+        return events
+
     def predict(
         self, features: np.ndarray
     ) -> Tuple[np.ndarray, np.ndarray]:
@@ -267,13 +456,16 @@ class EllipticEnvelopeHead:
         """
         self._check_fitted()
         n = features.shape[0]
+        if not self.envelopes_:
+            logger.warning(
+                "predict() called with no fitted envelopes; returning all unknown."
+            )
+            predictions = np.full(n, self.UNKNOWN_LABEL, dtype=np.int64)
+            return predictions, np.ones((n,), dtype=bool)
 
         # Gather per-class membership and Mahalanobis distances
-        memberships: Dict[int, np.ndarray] = {}
-        distances: Dict[int, np.ndarray] = {}
-        for cls_id, ee in self.envelopes_.items():
-            memberships[cls_id] = ee.predict(features) == 1  # inlier?
-            distances[cls_id] = ee.mahalanobis(features)
+        memberships = self.membership_masks(features)
+        distances = self.mahalanobis_distances(features)
 
         predictions = np.full(n, self.UNKNOWN_LABEL, dtype=np.int64)
 
@@ -368,6 +560,13 @@ class EllipticEnvelopeHead:
             inv = {v: k for k, v in self.label_map_.items()}
             return inv.get(cls_id, str(cls_id))
         return str(cls_id)
+
+    @staticmethod
+    def _as_scalar(value: Any) -> Any:
+        """Convert numpy scalar-like values into plain Python scalars."""
+        if isinstance(value, np.generic):
+            return value.item()
+        return value
 
     def _check_fitted(self) -> None:
         if not self.fitted_:

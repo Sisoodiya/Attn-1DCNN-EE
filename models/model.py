@@ -29,7 +29,7 @@ Inference modes
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -45,6 +45,7 @@ except ImportError:
 from models.cnn_backbone import CNN1DBackbone
 from models.attention import SoftAttention
 from models.ee_head import EllipticEnvelopeHead, GlobalAvgPool1d
+from models.reliability import ReliabilityAnalyzer
 
 logger = logging.getLogger(__name__)
 
@@ -386,3 +387,179 @@ class Attn1DCNN_EE(pl.LightningModule):
         _, attn_weights, pooled = self(x)
         predictions, is_unknown = self.ee_head.predict(pooled.cpu().numpy())
         return predictions, is_unknown, attn_weights
+
+    @torch.no_grad()
+    def detect_failure_events(
+        self,
+        x: torch.Tensor,
+        timestamps: Sequence[Any],
+        require_unique_acceptance: bool = False,
+    ) -> Dict[str, Any]:
+        """Binary failure detection with timestamped event logging.
+
+        This method pivots the EE output objective from fault category
+        prediction to reliability monitoring: any window outside the
+        accepted envelope boundary becomes a failure event.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Shape ``(B, F, I)`` input windows.
+        timestamps : sequence
+            Length ``B`` operating timestamps aligned with windows.
+        require_unique_acceptance : bool
+            Passed to EE binary detector. If ``True``, any non-unique
+            envelope acceptance is flagged as failure.
+
+        Returns
+        -------
+        dict
+            Contains binary failure mask, risk scores, nearest class,
+            and structured event logs.
+        """
+        if self.ee_head is None:
+            raise RuntimeError(
+                "EE head not fitted. Call fit_envelope() after training."
+            )
+        if len(timestamps) != int(x.shape[0]):
+            raise ValueError(
+                "timestamps length must match batch size: "
+                f"{len(timestamps)} != {int(x.shape[0])}"
+            )
+
+        self.eval()
+        x = x.to(self.device)
+        logits, attn_weights, pooled = self(x)
+        features = pooled.cpu().numpy()
+
+        predictions, is_unknown = self.ee_head.predict(features)
+        is_failure, risk_score, nearest_class, accept_counts = (
+            self.ee_head.predict_binary_failure(
+                features=features,
+                require_unique_acceptance=require_unique_acceptance,
+            )
+        )
+        events = self.ee_head.log_failure_events(
+            features=features,
+            timestamps=timestamps,
+            require_unique_acceptance=require_unique_acceptance,
+        )
+
+        return {
+            "predictions": predictions,
+            "is_unknown": is_unknown,
+            "is_failure": is_failure,
+            "risk_score": risk_score,
+            "nearest_class": nearest_class,
+            "accept_counts": accept_counts,
+            "events": events,
+            "logits": logits.detach().cpu(),
+            "attn_weights": attn_weights.detach().cpu(),
+            "features": features,
+        }
+
+    @torch.no_grad()
+    def monitor_reliability(
+        self,
+        dataloader: DataLoader,
+        timestamps: Optional[Sequence[Any]] = None,
+        timestamp_start: float = 0.0,
+        timestamp_step: float = 1.0,
+        require_unique_acceptance: bool = False,
+    ) -> Dict[str, Any]:
+        """Run reliability monitoring over an entire dataloader stream.
+
+        Parameters
+        ----------
+        dataloader : DataLoader
+            Window-level data stream.
+        timestamps : sequence | None
+            Optional operating timestamps for all windows. If omitted,
+            sequential timestamps are generated from
+            ``timestamp_start + i * timestamp_step``.
+        timestamp_start : float
+            Start value for generated timestamps.
+        timestamp_step : float
+            Step size for generated timestamps.
+        require_unique_acceptance : bool
+            Passed to EE failure detector.
+
+        Returns
+        -------
+        dict
+            Reliability summary, decay curve, binary detections, and
+            timestamped failure events.
+        """
+        if self.ee_head is None:
+            raise RuntimeError(
+                "EE head not fitted. Call fit_envelope() after training."
+            )
+
+        was_training = self.training
+        self.eval()
+
+        all_features: List[np.ndarray] = []
+        all_predictions: List[np.ndarray] = []
+        all_unknown: List[np.ndarray] = []
+
+        for batch in dataloader:
+            x, _ = batch
+            x = x.to(self.device)
+            _, _, pooled = self(x)
+            feats = pooled.detach().cpu().numpy()
+            preds, unknown = self.ee_head.predict(feats)
+            all_features.append(feats)
+            all_predictions.append(preds)
+            all_unknown.append(unknown)
+
+        if was_training:
+            self.train()
+
+        if not all_features:
+            raise ValueError("monitor_reliability() received an empty dataloader.")
+
+        features = np.concatenate(all_features, axis=0)
+        predictions = np.concatenate(all_predictions, axis=0)
+        is_unknown = np.concatenate(all_unknown, axis=0)
+        n = int(features.shape[0])
+
+        if timestamps is None:
+            ts = timestamp_start + timestamp_step * np.arange(n, dtype=np.float64)
+        else:
+            if len(timestamps) != n:
+                raise ValueError(
+                    "timestamps length must match number of windows: "
+                    f"{len(timestamps)} != {n}"
+                )
+            ts = np.asarray(list(timestamps))
+
+        is_failure, risk_score, nearest_class, accept_counts = (
+            self.ee_head.predict_binary_failure(
+                features=features,
+                require_unique_acceptance=require_unique_acceptance,
+            )
+        )
+        events = self.ee_head.log_failure_events(
+            features=features,
+            timestamps=ts,
+            require_unique_acceptance=require_unique_acceptance,
+        )
+
+        analyzer = ReliabilityAnalyzer()
+        reliability = analyzer.analyze(
+            timestamps=ts,
+            is_failure=is_failure,
+            risk_scores=risk_score,
+        )
+
+        return {
+            "predictions": predictions,
+            "is_unknown": is_unknown,
+            "is_failure": is_failure,
+            "risk_score": risk_score,
+            "nearest_class": nearest_class,
+            "accept_counts": accept_counts,
+            "events": events,
+            "features": features,
+            "reliability": reliability,
+        }
